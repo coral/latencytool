@@ -1,14 +1,10 @@
-use biquad::{Biquad, Coefficients, DirectForm1, ToHertz, Type, Q_BUTTERWORTH_F32};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Mutex;
 
-static PROBE_WAV: &[u8] = include_bytes!("../assets/probe3.wav");
+use crate::dsp::{self, BANDPASS_HIGH, BANDPASS_LOW, ENVELOPE_RATE};
 
-const BANDPASS_LOW: f32 = 500.0;
-const BANDPASS_HIGH: f32 = 3500.0;
-const ENVELOPE_LPF: f32 = 100.0;
-const ENVELOPE_RATE: u32 = 1000;
+static PROBE_WAV: &[u8] = include_bytes!("../assets/probe3.wav");
 
 pub struct Probe {
     pub samples: Vec<f32>,
@@ -108,64 +104,9 @@ impl Probe {
         }
 
         let resampled = self.resampled(sample_rate);
-        let filtered = bandpass_filter(&resampled, BANDPASS_LOW, BANDPASS_HIGH, sample_rate);
-        let envelope = extract_envelope(&filtered, sample_rate, ENVELOPE_RATE);
+        let filtered = dsp::bandpass_filter(&resampled, BANDPASS_LOW, BANDPASS_HIGH, sample_rate);
+        let envelope = dsp::extract_envelope(&filtered, sample_rate, ENVELOPE_RATE);
 
         cache.insert(sample_rate, CachedProbe { filtered, envelope });
     }
-}
-
-fn bandpass_filter(signal: &[f32], low_hz: f32, high_hz: f32, sample_rate: u32) -> Vec<f32> {
-    let fs = sample_rate.hz();
-
-    let hp_coeffs =
-        Coefficients::<f32>::from_params(Type::HighPass, fs, low_hz.hz(), Q_BUTTERWORTH_F32)
-            .unwrap();
-    let mut hp1 = DirectForm1::<f32>::new(hp_coeffs);
-    let mut hp2 = DirectForm1::<f32>::new(hp_coeffs);
-
-    let lp_coeffs =
-        Coefficients::<f32>::from_params(Type::LowPass, fs, high_hz.hz(), Q_BUTTERWORTH_F32)
-            .unwrap();
-    let mut lp1 = DirectForm1::<f32>::new(lp_coeffs);
-    let mut lp2 = DirectForm1::<f32>::new(lp_coeffs);
-
-    signal
-        .iter()
-        .map(|&x| {
-            let y = hp1.run(x);
-            let y = hp2.run(y);
-            let y = lp1.run(y);
-            lp2.run(y)
-        })
-        .collect()
-}
-
-fn extract_envelope(signal: &[f32], sample_rate: u32, target_rate: u32) -> Vec<f32> {
-    let fs = sample_rate.hz();
-
-    let lp_coeffs =
-        Coefficients::<f32>::from_params(Type::LowPass, fs, ENVELOPE_LPF.hz(), Q_BUTTERWORTH_F32)
-            .unwrap();
-    let mut lp1 = DirectForm1::<f32>::new(lp_coeffs);
-    let mut lp2 = DirectForm1::<f32>::new(lp_coeffs);
-
-    let decimation = sample_rate as usize / target_rate as usize;
-    if decimation == 0 {
-        return vec![];
-    }
-
-    let mut envelope = Vec::with_capacity(signal.len() / decimation + 1);
-
-    for (i, &x) in signal.iter().enumerate() {
-        let rectified = x.abs();
-        let y = lp1.run(rectified);
-        let y = lp2.run(y);
-
-        if i % decimation == 0 {
-            envelope.push(y);
-        }
-    }
-
-    envelope
 }

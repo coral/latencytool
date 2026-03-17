@@ -57,35 +57,35 @@ pub fn start_output_stream(
                 let ts = info.timestamp();
 
                 for frame in 0..frames {
-                    let sample = if st.probe_playing {
-                        let idx = st.probe_play_sample_idx;
+                    let sample = if st.probe.playing {
+                        let idx = st.probe.sample_idx;
                         if idx < probe_samples.len() {
                             let s = probe_samples[idx];
                             if idx == 0 {
-                                st.emission_write_pos = st.capture_write_pos;
-                                st.playback_instant = Some(ts.playback);
-                                st.output_callback_instant = Some(ts.callback);
-                                st.playback_frame_offset = frame as u32;
+                                st.probe.emission_write_pos = st.capture.write_pos;
+                                st.timestamps.playback = Some(ts.playback);
+                                st.timestamps.output_callback = Some(ts.callback);
+                                st.timestamps.frame_offset = frame as u32;
                             }
-                            st.probe_play_sample_idx = idx + 1;
+                            st.probe.sample_idx = idx + 1;
                             s
                         } else {
-                            st.probe_playing = false;
+                            st.probe.playing = false;
                             st.phase = MeasurementPhase::Listening;
-                            st.phase_start_sample = st.capture_sample_counter;
+                            st.phase_start_sample = st.capture.sample_counter;
                             0.0
                         }
-                    } else if st.probe_play_requested {
-                        st.probe_play_requested = false;
-                        st.probe_playing = true;
-                        st.probe_play_sample_idx = 0;
-                        st.emission_write_pos = st.capture_write_pos;
-                        st.playback_instant = Some(ts.playback);
-                        st.output_callback_instant = Some(ts.callback);
-                        st.playback_frame_offset = frame as u32;
+                    } else if st.probe.requested {
+                        st.probe.requested = false;
+                        st.probe.playing = true;
+                        st.probe.sample_idx = 0;
+                        st.probe.emission_write_pos = st.capture.write_pos;
+                        st.timestamps.playback = Some(ts.playback);
+                        st.timestamps.output_callback = Some(ts.callback);
+                        st.timestamps.frame_offset = frame as u32;
                         if !probe_samples.is_empty() {
                             let s = probe_samples[0];
-                            st.probe_play_sample_idx = 1;
+                            st.probe.sample_idx = 1;
                             s
                         } else {
                             0.0
@@ -127,15 +127,15 @@ pub fn start_input_stream(
             &stream_config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 let mut st = state.lock().unwrap();
-                let buf_len = st.capture_buffer.len();
+                let buf_len = st.capture.buffer.len();
 
                 for frame_samples in data.chunks(channels) {
                     let mono: f32 =
                         frame_samples.iter().sum::<f32>() / channels as f32;
-                    let pos = st.capture_write_pos % buf_len;
-                    st.capture_buffer[pos] = mono;
-                    st.capture_write_pos += 1;
-                    st.capture_sample_counter += 1;
+                    let pos = st.capture.write_pos % buf_len;
+                    st.capture.buffer[pos] = mono;
+                    st.capture.write_pos += 1;
+                    st.capture.sample_counter += 1;
                 }
             },
             move |err| {

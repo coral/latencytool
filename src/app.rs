@@ -1,5 +1,5 @@
 use cpal::traits::DeviceTrait;
-use cpal::{Stream, StreamInstant};
+use cpal::Stream;
 use eframe::egui;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -10,48 +10,9 @@ use crate::audio::{
 };
 use crate::config::Config;
 use crate::detection;
+use crate::latency::compute_latency_from_timestamps;
 use crate::probe::Probe;
 use crate::state::{AppMode, MeasurementPhase, SharedState};
-
-/// Result of hardware-timestamp-based latency computation.
-pub struct TimestampLatency {
-    pub latency_ms: f64,
-    pub output_delay_ms: f64,
-    pub lag_ms: f64,
-}
-
-/// Compute latency using hardware timestamps from CoreAudio.
-///
-/// The capture snapshot starts at `emission_write_pos` (set at output callback time).
-/// `lag_samples` into that snapshot, the probe appears. The output buffer delay
-/// (playback - callback) represents time before the probe reaches the DAC, so:
-///
-///   latency = lag_samples/input_rate - (playback - callback) - frame_offset/output_rate
-pub fn compute_latency_from_timestamps(
-    lag_samples: f64,
-    input_rate: u32,
-    output_rate: u32,
-    playback_instant: Option<StreamInstant>,
-    output_callback_instant: Option<StreamInstant>,
-    playback_frame_offset: u32,
-) -> TimestampLatency {
-    let playback_ts = playback_instant.expect("playback_instant must be set before detection");
-    let callback_ts = output_callback_instant.expect("output_callback_instant must be set before detection");
-
-    let probe_frame_offset = Duration::from_secs_f64(playback_frame_offset as f64 / output_rate as f64);
-    let output_delay = playback_ts.duration_since(&callback_ts)
-        .expect("playback must be after callback")
-        + probe_frame_offset;
-
-    let lag_secs = lag_samples / input_rate as f64;
-    let latency_ms = (lag_secs - output_delay.as_secs_f64()) * 1000.0;
-
-    TimestampLatency {
-        latency_ms,
-        output_delay_ms: output_delay.as_secs_f64() * 1000.0,
-        lag_ms: lag_secs * 1000.0,
-    }
-}
 
 pub struct LatencyApp {
     state: Arc<Mutex<SharedState>>,
@@ -75,15 +36,15 @@ impl LatencyApp {
         let probe = Arc::new(Probe::load());
 
         let config = Config::load();
-        if let Some(ref name) = config.output_device {
-            if let Some(idx) = output_devices.iter().position(|d| &d.name == name) {
-                state.lock().unwrap().output_device_idx = Some(idx);
-            }
+        if let Some(ref name) = config.output_device
+            && let Some(idx) = output_devices.iter().position(|d| &d.name == name)
+        {
+            state.lock().unwrap().output_device_idx = Some(idx);
         }
-        if let Some(ref name) = config.input_device {
-            if let Some(idx) = input_devices.iter().position(|d| &d.name == name) {
-                state.lock().unwrap().input_device_idx = Some(idx);
-            }
+        if let Some(ref name) = config.input_device
+            && let Some(idx) = input_devices.iter().position(|d| &d.name == name)
+        {
+            state.lock().unwrap().input_device_idx = Some(idx);
         }
 
         Self {
@@ -154,8 +115,8 @@ impl LatencyApp {
                 let mut st = self.state.lock().unwrap();
                 st.input_sample_rate = rate;
                 let buf_size = (rate as usize) * 10;
-                st.capture_buffer = vec![0.0; buf_size];
-                st.capture_write_pos = 0;
+                st.capture.buffer = vec![0.0; buf_size];
+                st.capture.write_pos = 0;
                 st.streams_active = true;
             }
             Err(e) => {
@@ -171,8 +132,8 @@ impl LatencyApp {
 
     fn stop_streams(&mut self) {
         let mut st = self.state.lock().unwrap();
-        st.probe_playing = false;
-        st.probe_play_requested = false;
+        st.probe.playing = false;
+        st.probe.requested = false;
         st.phase = MeasurementPhase::Idle;
         st.mode = AppMode::Idle;
     }
@@ -181,7 +142,7 @@ impl LatencyApp {
         {
             let mut st = self.state.lock().unwrap();
             st.mode = AppMode::Calibrating;
-            st.calibration_measurements.clear();
+            st.calibration.measurements.clear();
             st.phase = MeasurementPhase::Idle;
             st.error_message = None;
         }
@@ -189,7 +150,7 @@ impl LatencyApp {
         let mut st = self.state.lock().unwrap();
         if st.streams_active {
             st.phase = MeasurementPhase::Playing;
-            st.probe_play_requested = true;
+            st.probe.requested = true;
         }
     }
 
@@ -205,7 +166,7 @@ impl LatencyApp {
         let mut st = self.state.lock().unwrap();
         if st.streams_active {
             st.phase = MeasurementPhase::Playing;
-            st.probe_play_requested = true;
+            st.probe.requested = true;
         }
     }
 
@@ -236,7 +197,7 @@ impl LatencyApp {
 
     fn save_measurements_csv(&self, filename: &str) -> Result<(), String> {
         let st = self.state.lock().unwrap();
-        if st.measurements.is_empty() {
+        if st.measurement.values.is_empty() {
             return Err("No measurements to save".to_string());
         }
 
@@ -247,7 +208,7 @@ impl LatencyApp {
         };
 
         let mut contents = String::from("measurement,latency_ms\n");
-        for (i, &val) in st.measurements.iter().enumerate() {
+        for (i, &val) in st.measurement.values.iter().enumerate() {
             contents.push_str(&format!("{},{:.2}\n", i + 1, val));
         }
         drop(st);
@@ -271,18 +232,7 @@ impl LatencyApp {
                         break;
                     }
                     let should = st.phase == MeasurementPhase::Listening;
-                    let buf_len = st.capture_buffer.len();
-                    let emission_pos = st.emission_write_pos % buf_len;
-                    let write_pos = st.capture_write_pos % buf_len;
-                    let buf = if write_pos > emission_pos {
-                        st.capture_buffer[emission_pos..write_pos].to_vec()
-                    } else if st.capture_write_pos > st.emission_write_pos {
-                        let mut v = st.capture_buffer[emission_pos..].to_vec();
-                        v.extend_from_slice(&st.capture_buffer[..write_pos]);
-                        v
-                    } else {
-                        vec![]
-                    };
+                    let buf = st.capture_snapshot();
                     (
                         should,
                         st.input_sample_rate,
@@ -290,9 +240,9 @@ impl LatencyApp {
                         buf,
                         st.mode,
                         st.phase,
-                        st.playback_instant,
-                        st.output_callback_instant,
-                        st.playback_frame_offset,
+                        st.timestamps.playback,
+                        st.timestamps.output_callback,
+                        st.timestamps.frame_offset,
                     )
                 };
 
@@ -302,13 +252,13 @@ impl LatencyApp {
 
                 if phase == MeasurementPhase::Listening {
                     let st = state.lock().unwrap();
-                    let elapsed = st.capture_sample_counter.saturating_sub(st.phase_start_sample);
+                    let elapsed = st.capture.sample_counter.saturating_sub(st.phase_start_sample);
                     if elapsed > st.listen_timeout_samples {
                         drop(st);
                         let mut st = state.lock().unwrap();
-                        st.miss_count += 1;
+                        st.measurement.miss_count += 1;
                         st.phase = MeasurementPhase::Playing;
-                        st.probe_play_requested = true;
+                        st.probe.requested = true;
                         continue;
                     }
                 }
@@ -339,42 +289,277 @@ impl LatencyApp {
                     );
 
                     let mut st = state.lock().unwrap();
-                    st.last_ncc_peak = ncc_peak;
-                    st.last_latency_ms = Some(ts_result.latency_ms);
-                    st.last_output_delay_ms = Some(ts_result.output_delay_ms);
-                    st.last_lag_ms = Some(ts_result.lag_ms);
+                    st.detection.ncc_peak = ncc_peak;
+                    st.detection.latency_ms = Some(ts_result.latency_ms);
+                    st.detection.output_delay_ms = Some(ts_result.output_delay_ms);
+                    st.detection.lag_ms = Some(ts_result.lag_ms);
                     st.phase = MeasurementPhase::Detected;
 
                     match st.mode {
                         AppMode::Calibrating => {
-                            st.calibration_measurements.push(ts_result.latency_ms);
-                            let done = st.calibration_measurements.len() >= st.calibration_count;
+                            st.calibration.measurements.push(ts_result.latency_ms);
+                            let done = st.calibration.measurements.len() >= st.calibration.count;
                             if done {
-                                let mut cal = st.calibration_measurements.clone();
+                                let mut cal = st.calibration.measurements.clone();
                                 cal.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                                st.system_offset_ms = cal[cal.len() / 2];
+                                st.calibration.system_offset_ms = cal[cal.len() / 2];
                                 st.mode = AppMode::Idle;
                                 st.phase = MeasurementPhase::Idle;
                             } else {
                                 st.phase = MeasurementPhase::Playing;
-                                st.probe_play_requested = true;
+                                st.probe.requested = true;
                             }
                         }
                         AppMode::Measuring => {
-                            let adjusted = (ts_result.latency_ms - st.system_offset_ms).max(0.0);
-                            st.measurements.push_back(adjusted);
-                            st.measurement_count += 1;
-                            while st.measurements.len() > 1000 {
-                                st.measurements.pop_front();
+                            let adjusted = (ts_result.latency_ms - st.calibration.system_offset_ms).max(0.0);
+                            st.measurement.values.push_back(adjusted);
+                            st.measurement.count += 1;
+                            while st.measurement.values.len() > 1000 {
+                                st.measurement.values.pop_front();
                             }
                             st.phase = MeasurementPhase::Playing;
-                            st.probe_play_requested = true;
+                            st.probe.requested = true;
                         }
                         AppMode::Idle => {}
                     }
                 }
             }
         });
+    }
+
+    fn render_device_selector(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Output Device:");
+            let current_out = self.state.lock().unwrap().output_device_idx;
+            let mut selected = current_out.unwrap_or(0);
+            let names: Vec<String> =
+                self.output_devices.iter().map(|d| d.name.clone()).collect();
+            egui::ComboBox::from_id_salt("output_device")
+                .selected_text(
+                    names
+                        .get(selected)
+                        .cloned()
+                        .unwrap_or_else(|| "None".to_string()),
+                )
+                .show_ui(ui, |ui| {
+                    for (i, name) in names.iter().enumerate() {
+                        if ui.selectable_value(&mut selected, i, name).changed() {
+                            self.state.lock().unwrap().output_device_idx = Some(selected);
+                            self.save_device_config();
+                        }
+                    }
+                });
+            if current_out.is_none() && !self.output_devices.is_empty() {
+                self.state.lock().unwrap().output_device_idx = Some(0);
+                self.save_device_config();
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Input Device: ");
+            let current_in = self.state.lock().unwrap().input_device_idx;
+            let mut selected = current_in.unwrap_or(0);
+            let names: Vec<String> =
+                self.input_devices.iter().map(|d| d.name.clone()).collect();
+            egui::ComboBox::from_id_salt("input_device")
+                .selected_text(
+                    names
+                        .get(selected)
+                        .cloned()
+                        .unwrap_or_else(|| "None".to_string()),
+                )
+                .show_ui(ui, |ui| {
+                    for (i, name) in names.iter().enumerate() {
+                        if ui.selectable_value(&mut selected, i, name).changed() {
+                            self.state.lock().unwrap().input_device_idx = Some(selected);
+                            self.save_device_config();
+                        }
+                    }
+                });
+            if current_in.is_none() && !self.input_devices.is_empty() {
+                self.state.lock().unwrap().input_device_idx = Some(0);
+                self.save_device_config();
+            }
+        });
+    }
+
+    fn render_controls(&mut self, ui: &mut egui::Ui) {
+        let mode = {
+            let st = self.state.lock().unwrap();
+            st.mode
+        };
+
+        ui.horizontal(|ui| {
+            let is_running = mode != AppMode::Idle;
+            if !is_running {
+                if ui.button("Calibrate").clicked() {
+                    self.start_calibration();
+                }
+                if ui.button("Measure").clicked() {
+                    self.start_measuring();
+                }
+            } else if ui.button("Stop").clicked() {
+                self.stop();
+            }
+        });
+    }
+
+    fn render_status(&self, ui: &mut egui::Ui) {
+        let st = self.state.lock().unwrap();
+
+        ui.horizontal(|ui| {
+            ui.label("Mode:");
+            ui.strong(match st.mode {
+                AppMode::Idle => "Idle",
+                AppMode::Calibrating => "Calibrating",
+                AppMode::Measuring => "Measuring",
+            });
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Phase:");
+            ui.strong(match st.phase {
+                MeasurementPhase::Idle => "Idle",
+                MeasurementPhase::Playing => "Playing probe...",
+                MeasurementPhase::Listening => "Listening...",
+                MeasurementPhase::Detected => "Detected!",
+            });
+        });
+
+        if st.calibration.system_offset_ms > 0.0 {
+            ui.horizontal(|ui| {
+                ui.label("System offset (calibration):");
+                ui.strong(format!("{:.1} ms", st.calibration.system_offset_ms));
+            });
+        }
+
+        if st.mode == AppMode::Calibrating {
+            ui.horizontal(|ui| {
+                ui.label("Calibration progress:");
+                ui.strong(format!(
+                    "{}/{}",
+                    st.calibration.measurements.len(),
+                    st.calibration.count
+                ));
+            });
+        }
+
+        // Timing breakdown
+        if st.detection.latency_ms.is_some() || st.detection.lag_ms.is_some() {
+            ui.separator();
+            ui.heading("Timing");
+            egui::Grid::new("timing_grid")
+                .num_columns(2)
+                .spacing([40.0, 4.0])
+                .show(ui, |ui| {
+                    if let Some(lag) = st.detection.lag_ms {
+                        ui.label("Detection lag:");
+                        ui.label(format!("{:.1} ms", lag));
+                        ui.end_row();
+                    }
+                    if let Some(delay) = st.detection.output_delay_ms {
+                        ui.label("Playout delay:");
+                        ui.label(format!("{:.1} ms", delay));
+                        ui.end_row();
+                    }
+                    if let Some(latency) = st.detection.latency_ms {
+                        ui.label("Round-trip latency:");
+                        ui.strong(format!("{:.1} ms", latency));
+                        ui.end_row();
+                    }
+                    ui.label("NCC confidence:");
+                    ui.label(format!("{:.3}", st.detection.ncc_peak));
+                    ui.end_row();
+                    ui.label("Output sample rate:");
+                    ui.label(format!("{} Hz", st.output_sample_rate));
+                    ui.end_row();
+                    ui.label("Input sample rate:");
+                    ui.label(format!("{} Hz", st.input_sample_rate));
+                    ui.end_row();
+                });
+        }
+
+        ui.separator();
+
+        // Statistics
+        if let Some(stats) = st.stats() {
+            ui.heading("Measurement Statistics");
+            egui::Grid::new("stats_grid")
+                .num_columns(2)
+                .spacing([40.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("Min:");
+                    ui.label(format!("{:.1} ms", stats.min));
+                    ui.end_row();
+                    ui.label("Avg:");
+                    ui.label(format!("{:.1} ms", stats.avg));
+                    ui.end_row();
+                    ui.label("P50:");
+                    ui.label(format!("{:.1} ms", stats.p50));
+                    ui.end_row();
+                    ui.label("P95:");
+                    ui.label(format!("{:.1} ms", stats.p95));
+                    ui.end_row();
+                    ui.label("Max:");
+                    ui.label(format!("{:.1} ms", stats.max));
+                    ui.end_row();
+                    ui.label("Count:");
+                    ui.label(format!("{}", stats.count));
+                    ui.end_row();
+                    ui.label("Misses:");
+                    ui.label(format!("{}", stats.misses));
+                    ui.end_row();
+                });
+        }
+
+        // Error display
+        if let Some(ref err) = st.error_message {
+            ui.separator();
+            ui.colored_label(egui::Color32::RED, err);
+        }
+    }
+
+    fn render_save_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_save_dialog {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Save Results")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Filename:");
+                    ui.text_edit_singleline(&mut self.save_filename);
+                    ui.label(".csv");
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() && !self.save_filename.is_empty() {
+                        match self.save_measurements_csv(&self.save_filename) {
+                            Ok(()) => {
+                                let path = if self.save_filename.ends_with(".csv") {
+                                    self.save_filename.clone()
+                                } else {
+                                    format!("{}.csv", self.save_filename)
+                                };
+                                self.save_message = Some(format!("Saved to {}", path));
+                                self.show_save_dialog = false;
+                            }
+                            Err(e) => {
+                                self.save_message = Some(e);
+                                self.show_save_dialog = false;
+                            }
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.show_save_dialog = false;
+                    }
+                });
+            });
+        if !open {
+            self.show_save_dialog = false;
+        }
     }
 }
 
@@ -386,198 +571,13 @@ impl eframe::App for LatencyApp {
             ui.heading("Audio Latency Measurement Tool");
             ui.separator();
 
-            // Device selection
-            ui.horizontal(|ui| {
-                ui.label("Output Device:");
-                let current_out = self.state.lock().unwrap().output_device_idx;
-                let mut selected = current_out.unwrap_or(0);
-                let names: Vec<String> =
-                    self.output_devices.iter().map(|d| d.name.clone()).collect();
-                egui::ComboBox::from_id_salt("output_device")
-                    .selected_text(
-                        names
-                            .get(selected)
-                            .cloned()
-                            .unwrap_or_else(|| "None".to_string()),
-                    )
-                    .show_ui(ui, |ui| {
-                        for (i, name) in names.iter().enumerate() {
-                            if ui.selectable_value(&mut selected, i, name).changed() {
-                                self.state.lock().unwrap().output_device_idx = Some(selected);
-                                self.save_device_config();
-                            }
-                        }
-                    });
-                if current_out.is_none() && !self.output_devices.is_empty() {
-                    self.state.lock().unwrap().output_device_idx = Some(0);
-                    self.save_device_config();
-                }
-            });
-
-            ui.horizontal(|ui| {
-                ui.label("Input Device: ");
-                let current_in = self.state.lock().unwrap().input_device_idx;
-                let mut selected = current_in.unwrap_or(0);
-                let names: Vec<String> =
-                    self.input_devices.iter().map(|d| d.name.clone()).collect();
-                egui::ComboBox::from_id_salt("input_device")
-                    .selected_text(
-                        names
-                            .get(selected)
-                            .cloned()
-                            .unwrap_or_else(|| "None".to_string()),
-                    )
-                    .show_ui(ui, |ui| {
-                        for (i, name) in names.iter().enumerate() {
-                            if ui.selectable_value(&mut selected, i, name).changed() {
-                                self.state.lock().unwrap().input_device_idx = Some(selected);
-                                self.save_device_config();
-                            }
-                        }
-                    });
-                if current_in.is_none() && !self.input_devices.is_empty() {
-                    self.state.lock().unwrap().input_device_idx = Some(0);
-                    self.save_device_config();
-                }
-            });
-
+            self.render_device_selector(ui);
             ui.separator();
 
-            // Controls
-            let mode = {
-                let st = self.state.lock().unwrap();
-                st.mode
-            };
-
-            ui.horizontal(|ui| {
-                let is_running = mode != AppMode::Idle;
-                if !is_running {
-                    if ui.button("Calibrate").clicked() {
-                        self.start_calibration();
-                    }
-                    if ui.button("Measure").clicked() {
-                        self.start_measuring();
-                    }
-                } else if ui.button("Stop").clicked() {
-                    self.stop();
-                }
-            });
-
+            self.render_controls(ui);
             ui.separator();
 
-            // Status
-            let st = self.state.lock().unwrap();
-
-            ui.horizontal(|ui| {
-                ui.label("Mode:");
-                ui.strong(match st.mode {
-                    AppMode::Idle => "Idle",
-                    AppMode::Calibrating => "Calibrating",
-                    AppMode::Measuring => "Measuring",
-                });
-            });
-
-            ui.horizontal(|ui| {
-                ui.label("Phase:");
-                ui.strong(match st.phase {
-                    MeasurementPhase::Idle => "Idle",
-                    MeasurementPhase::Playing => "Playing probe...",
-                    MeasurementPhase::Listening => "Listening...",
-                    MeasurementPhase::Detected => "Detected!",
-                });
-            });
-
-            if st.system_offset_ms > 0.0 {
-                ui.horizontal(|ui| {
-                    ui.label("System offset (calibration):");
-                    ui.strong(format!("{:.1} ms", st.system_offset_ms));
-                });
-            }
-
-            if st.mode == AppMode::Calibrating {
-                ui.horizontal(|ui| {
-                    ui.label("Calibration progress:");
-                    ui.strong(format!(
-                        "{}/{}",
-                        st.calibration_measurements.len(),
-                        st.calibration_count
-                    ));
-                });
-            }
-
-            // Timing breakdown
-            if st.last_latency_ms.is_some() || st.last_lag_ms.is_some() {
-                ui.separator();
-                ui.heading("Timing");
-                egui::Grid::new("timing_grid")
-                    .num_columns(2)
-                    .spacing([40.0, 4.0])
-                    .show(ui, |ui| {
-                        if let Some(lag) = st.last_lag_ms {
-                            ui.label("Detection lag:");
-                            ui.label(format!("{:.1} ms", lag));
-                            ui.end_row();
-                        }
-                        if let Some(delay) = st.last_output_delay_ms {
-                            ui.label("Playout delay:");
-                            ui.label(format!("{:.1} ms", delay));
-                            ui.end_row();
-                        }
-                        if let Some(latency) = st.last_latency_ms {
-                            ui.label("Round-trip latency:");
-                            ui.strong(format!("{:.1} ms", latency));
-                            ui.end_row();
-                        }
-                        ui.label("NCC confidence:");
-                        ui.label(format!("{:.3}", st.last_ncc_peak));
-                        ui.end_row();
-                        ui.label("Output sample rate:");
-                        ui.label(format!("{} Hz", st.output_sample_rate));
-                        ui.end_row();
-                        ui.label("Input sample rate:");
-                        ui.label(format!("{} Hz", st.input_sample_rate));
-                        ui.end_row();
-                    });
-            }
-
-            ui.separator();
-
-            // Statistics
-            if let Some(stats) = st.stats() {
-                ui.heading("Measurement Statistics");
-                egui::Grid::new("stats_grid")
-                    .num_columns(2)
-                    .spacing([40.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.label("Min:");
-                        ui.label(format!("{:.1} ms", stats.min));
-                        ui.end_row();
-                        ui.label("Avg:");
-                        ui.label(format!("{:.1} ms", stats.avg));
-                        ui.end_row();
-                        ui.label("P50:");
-                        ui.label(format!("{:.1} ms", stats.p50));
-                        ui.end_row();
-                        ui.label("P95:");
-                        ui.label(format!("{:.1} ms", stats.p95));
-                        ui.end_row();
-                        ui.label("Max:");
-                        ui.label(format!("{:.1} ms", stats.max));
-                        ui.end_row();
-                        ui.label("Count:");
-                        ui.label(format!("{}", stats.count));
-                        ui.end_row();
-                        ui.label("Misses:");
-                        ui.label(format!("{}", stats.misses));
-                        ui.end_row();
-                    });
-            }
-
-            // Error display
-            if let Some(ref err) = st.error_message {
-                ui.separator();
-                ui.colored_label(egui::Color32::RED, err);
-            }
+            self.render_status(ui);
 
             // Save message
             if let Some(ref msg) = self.save_message {
@@ -586,8 +586,7 @@ impl eframe::App for LatencyApp {
             }
 
             // Save button — bottom right
-            let has_measurements = !st.measurements.is_empty();
-            drop(st);
+            let has_measurements = !self.state.lock().unwrap().measurement.values.is_empty();
 
             ui.separator();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
@@ -599,45 +598,6 @@ impl eframe::App for LatencyApp {
             });
         });
 
-        // Save dialog window
-        if self.show_save_dialog {
-            let mut open = true;
-            egui::Window::new("Save Results")
-                .collapsible(false)
-                .resizable(false)
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Filename:");
-                        ui.text_edit_singleline(&mut self.save_filename);
-                        ui.label(".csv");
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.button("Save").clicked() && !self.save_filename.is_empty() {
-                            match self.save_measurements_csv(&self.save_filename) {
-                                Ok(()) => {
-                                    let path = if self.save_filename.ends_with(".csv") {
-                                        self.save_filename.clone()
-                                    } else {
-                                        format!("{}.csv", self.save_filename)
-                                    };
-                                    self.save_message = Some(format!("Saved to {}", path));
-                                    self.show_save_dialog = false;
-                                }
-                                Err(e) => {
-                                    self.save_message = Some(e);
-                                    self.show_save_dialog = false;
-                                }
-                            }
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.show_save_dialog = false;
-                        }
-                    });
-                });
-            if !open {
-                self.show_save_dialog = false;
-            }
-        }
+        self.render_save_dialog(ctx);
     }
 }

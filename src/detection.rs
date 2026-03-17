@@ -1,11 +1,8 @@
-use biquad::{Biquad, Coefficients, DirectForm1, ToHertz, Type, Q_BUTTERWORTH_F32};
 use log::{debug, info};
 use rustfft::{num_complex::Complex, FftPlanner};
 
-const ENVELOPE_RATE: u32 = 1000;
-const BANDPASS_LOW: f32 = 500.0;
-const BANDPASS_HIGH: f32 = 3500.0;
-const ENVELOPE_LPF: f32 = 100.0;
+use crate::dsp::{self, BANDPASS_HIGH, BANDPASS_LOW, ENVELOPE_RATE};
+
 const NUM_COARSE_CANDIDATES: usize = 5;
 const COARSE_CANDIDATE_MIN_SEPARATION: usize = 200; // 200ms at 1000Hz envelope rate
 const TRANSIENT_SKIP: usize = 10; // 10 envelope samples = 10ms at 1kHz
@@ -24,8 +21,8 @@ pub fn detect_probe(
     max_latency_ms: f64,
 ) -> Option<(f64, f32)> {
     // Extract envelope from capture
-    let filtered_capture = bandpass_filter(capture, BANDPASS_LOW, BANDPASS_HIGH, sample_rate);
-    let env_capture = extract_envelope(&filtered_capture, sample_rate, ENVELOPE_RATE);
+    let filtered_capture = dsp::bandpass_filter(capture, BANDPASS_LOW, BANDPASS_HIGH, sample_rate);
+    let env_capture = dsp::extract_envelope(&filtered_capture, sample_rate, ENVELOPE_RATE);
     let env_template = template_envelope.to_vec();
 
     if env_capture.len() < env_template.len() + TRANSIENT_SKIP || env_template.len() < 2 {
@@ -47,8 +44,8 @@ pub fn detect_probe(
     let norm_len = (max_lag_envelope + env_template.len()).min(env_capture_trimmed.len());
     let mut env_capture_norm = env_capture_trimmed[..norm_len].to_vec();
     let mut env_template_norm = env_template.clone();
-    normalize(&mut env_capture_norm);
-    normalize(&mut env_template_norm);
+    dsp::normalize(&mut env_capture_norm);
+    dsp::normalize(&mut env_template_norm);
 
     // Compute envelope NCC and find best peak
     let ncc_values = envelope_ncc_values(
@@ -201,82 +198,6 @@ fn fine_stage_ncc(
     Some((precise_lag, best_ncc as f32))
 }
 
-/// Band-pass filter using two cascaded 2nd-order biquad sections (4th order Butterworth)
-fn bandpass_filter(signal: &[f32], low_hz: f32, high_hz: f32, sample_rate: u32) -> Vec<f32> {
-    let fs = sample_rate.hz();
-
-    let hp_coeffs =
-        Coefficients::<f32>::from_params(Type::HighPass, fs, low_hz.hz(), Q_BUTTERWORTH_F32)
-            .unwrap();
-    let mut hp1 = DirectForm1::<f32>::new(hp_coeffs);
-    let mut hp2 = DirectForm1::<f32>::new(hp_coeffs);
-
-    let lp_coeffs =
-        Coefficients::<f32>::from_params(Type::LowPass, fs, high_hz.hz(), Q_BUTTERWORTH_F32)
-            .unwrap();
-    let mut lp1 = DirectForm1::<f32>::new(lp_coeffs);
-    let mut lp2 = DirectForm1::<f32>::new(lp_coeffs);
-
-    signal
-        .iter()
-        .map(|&x| {
-            let y = hp1.run(x);
-            let y = hp2.run(y);
-            let y = lp1.run(y);
-            lp2.run(y)
-        })
-        .collect()
-}
-
-/// Extract amplitude envelope: abs(signal) → low-pass at 30Hz → downsample to target_rate
-fn extract_envelope(signal: &[f32], sample_rate: u32, target_rate: u32) -> Vec<f32> {
-    let fs = sample_rate.hz();
-
-    let lp_coeffs =
-        Coefficients::<f32>::from_params(Type::LowPass, fs, ENVELOPE_LPF.hz(), Q_BUTTERWORTH_F32)
-            .unwrap();
-    let mut lp1 = DirectForm1::<f32>::new(lp_coeffs);
-    let mut lp2 = DirectForm1::<f32>::new(lp_coeffs);
-
-    let decimation = sample_rate as usize / target_rate as usize;
-    if decimation == 0 {
-        return vec![];
-    }
-
-    let mut envelope = Vec::with_capacity(signal.len() / decimation + 1);
-
-    for (i, &x) in signal.iter().enumerate() {
-        let rectified = x.abs();
-        let y = lp1.run(rectified);
-        let y = lp2.run(y);
-
-        if i % decimation == 0 {
-            envelope.push(y);
-        }
-    }
-
-    envelope
-}
-
-/// Normalize in-place: subtract mean, divide by std dev
-fn normalize(signal: &mut [f32]) {
-    if signal.is_empty() {
-        return;
-    }
-    let n = signal.len() as f32;
-    let mean = signal.iter().sum::<f32>() / n;
-    for x in signal.iter_mut() {
-        *x -= mean;
-    }
-    let variance = signal.iter().map(|x| x * x).sum::<f32>() / n;
-    let std_dev = variance.sqrt();
-    if std_dev > 1e-10 {
-        for x in signal.iter_mut() {
-            *x /= std_dev;
-        }
-    }
-}
-
 /// FFT-based NCC on envelopes. Returns the full NCC values array.
 fn envelope_ncc_values(
     capture_env: &[f32],
@@ -292,14 +213,14 @@ fn envelope_ncc_values(
     let mut cap_fft: Vec<Complex<f32>> = capture_env
         .iter()
         .map(|&x| Complex::new(x, 0.0))
-        .chain(std::iter::repeat(Complex::new(0.0, 0.0)).take(n - capture_env.len()))
+        .chain(std::iter::repeat_n(Complex::new(0.0, 0.0), n - capture_env.len()))
         .collect();
     fft.process(&mut cap_fft);
 
     let mut tmpl_fft: Vec<Complex<f32>> = template_env
         .iter()
         .map(|&x| Complex::new(x, 0.0))
-        .chain(std::iter::repeat(Complex::new(0.0, 0.0)).take(n - template_env.len()))
+        .chain(std::iter::repeat_n(Complex::new(0.0, 0.0), n - template_env.len()))
         .collect();
     fft.process(&mut tmpl_fft);
 
@@ -369,8 +290,8 @@ fn find_top_peaks(ncc_values: &[f32], top_n: usize, min_separation: usize) -> Ve
 
         let start = best_lag.saturating_sub(min_separation);
         let end = (best_lag + min_separation).min(max_lag);
-        for i in start..=end {
-            used[i] = true;
+        for flag in used.iter_mut().take(end + 1).skip(start) {
+            *flag = true;
         }
     }
 
